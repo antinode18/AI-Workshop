@@ -1,0 +1,149 @@
+name: Review Agent (/review)
+
+# Triggered when someone comments "/review" on any issue
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  review:
+    # Only run when the comment body is exactly "/review" (trimmed)
+    if: |
+      github.event.issue.pull_request == null &&
+      contains(github.event.comment.body, '/review')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write      # needed to commit generated files back to main
+      issues: write        # needed to post the summary comment
+
+    steps:
+      # -----------------------------------------------------------------------
+      # 1. React to the comment so the user knows the workflow started
+      # -----------------------------------------------------------------------
+      - name: React to comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.reactions.createForIssueComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: context.payload.comment.id,
+              content: 'rocket'
+            });
+
+      # -----------------------------------------------------------------------
+      # 2. Check out the repository (main branch)
+      # -----------------------------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      # -----------------------------------------------------------------------
+      # 3. Set up Python
+      # -----------------------------------------------------------------------
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # -----------------------------------------------------------------------
+      # 4. Install Python dependencies
+      # -----------------------------------------------------------------------
+      - name: Install dependencies
+        run: pip install -r scripts/requirements.txt
+
+      # -----------------------------------------------------------------------
+      # 5. Verify that the Excel file exists before running the script
+      # -----------------------------------------------------------------------
+      - name: Check Excel file exists
+        id: check_excel
+        run: |
+          if [ -f "Sample_Data.xlsx" ]; then
+            echo "excel_found=true" >> "$GITHUB_OUTPUT"
+            echo "Excel file found at repo root: Sample_Data.xlsx"
+          elif [ -f "input/Sample_Data.xlsx" ]; then
+            echo "excel_found=true" >> "$GITHUB_OUTPUT"
+            echo "Excel file found in input/: input/Sample_Data.xlsx"
+          else
+            echo "excel_found=false" >> "$GITHUB_OUTPUT"
+            echo "::error::Sample_Data.xlsx not found in repo root or input/ directory."
+          fi
+
+      # -----------------------------------------------------------------------
+      # 6. Run the review agent Python script
+      # -----------------------------------------------------------------------
+      - name: Run review agent
+        if: steps.check_excel.outputs.excel_found == 'true'
+        run: python scripts/review_agent.py
+
+      # -----------------------------------------------------------------------
+      # 7. Commit and push generated files back to main
+      # -----------------------------------------------------------------------
+      - name: Commit and push generated reports
+        if: steps.check_excel.outputs.excel_found == 'true'
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add daily_summary/daily_summary.md daily_summary/review.md
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "chore: update daily_summary reports [skip ci]"
+            git push origin main
+          fi
+
+      # -----------------------------------------------------------------------
+      # 8. Post a success comment on the issue
+      # -----------------------------------------------------------------------
+      - name: Post success comment
+        if: steps.check_excel.outputs.excel_found == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const today = new Date().toISOString().split('T')[0];
+            const body = [
+              '## ✅ Review Agent — Reports Generated',
+              '',
+              `**Date:** ${today}`,
+              '',
+              'The `/review` agent has finished analyzing `Sample_Data.xlsx` and generated two reports:',
+              '',
+              '| Report | Path | Description |',
+              '|--------|------|-------------|',
+              '| 📊 Daily Summary | [`daily_summary/daily_summary.md`](../../blob/main/daily_summary/daily_summary.md) | 5 key data insights + executive summary |',
+              '| ❓ Review Questions | [`daily_summary/review.md`](../../blob/main/daily_summary/review.md) | Critical questions likely to be asked, with suggested answers |',
+              '',
+              '### Highlights',
+              '> See the full reports at the links above for detailed analysis.',
+              '',
+              '_Generated by the `/review` GitHub Actions workflow._',
+            ].join('\n');
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.issue.number,
+              body
+            });
+
+      # -----------------------------------------------------------------------
+      # 9. Post an error comment if the Excel file was not found
+      # -----------------------------------------------------------------------
+      - name: Post error comment
+        if: steps.check_excel.outputs.excel_found == 'false'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.issue.number,
+              body: [
+                '## ❌ Review Agent — Error',
+                '',
+                '`Sample_Data.xlsx` was not found in the repository root or the `input/` folder.',
+                '',
+                'Please upload the Excel file to either location and try `/review` again.',
+              ].join('\n')
+            });
